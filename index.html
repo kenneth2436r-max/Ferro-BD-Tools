@@ -971,10 +971,13 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
 
   <div class="card" style="border:2px solid #C8501B;">
     <h3>1. Connect Google Sheets</h3>
-    <p class="muted" style="margin-top:0;">Paste the OAuth Client ID from your Google Cloud Console project (Ferro Hub business account) - see the setup guide for exact steps.</p>
+    <p class="muted" style="margin-top:0;">Paste the OAuth Client ID and API key from your Google Cloud Console project (Ferro Hub business account) - see the setup guide for exact steps.</p>
     <div class="row">
       <div style="flex:2;"><label>Google OAuth Client ID</label><input type="text" id="bd-client-id" class="editable" placeholder="xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"></div>
-      <div style="flex:0 0 auto;align-self:flex-end;">
+      <div style="flex:2;"><label>Google API Key</label><input type="text" id="bd-api-key" class="editable" placeholder="AIzaSy..."></div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 auto;">
         <button class="btn small no-print" onclick="initGoogleSignIn()">Sign in with Google</button>
         <button class="btn small secondary no-print" onclick="signOutGoogle()">Sign out</button>
       </div>
@@ -5762,6 +5765,7 @@ syncTaskNotifications();
 // file opened straight from disk (file:// protocol), so that case is handled explicitly
 // rather than left to fail with a confusing error.
 const GOOGLE_CLIENT_ID_KEY = "ferrohub_google_client_id_v1";
+const GOOGLE_API_KEY_KEY = "ferrohub_google_api_key_v1";
 const LINKED_SHEETS_KEY = "ferrohub_linked_sheets_v1";
 const RESEARCH_SUGGESTIONS_KEY = "ferrohub_research_suggestions_v1";
 const SHEETS_SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets.readonly";
@@ -5796,6 +5800,7 @@ const BD_CATEGORY_FIELDS = {
 };
 
 let googleAccessToken = null; // in-memory only - never persisted to localStorage
+let googleApiKey = "";
 let tokenClient = null;
 let pickerApiLoaded = false;
 let linkedSheets = [];
@@ -5833,13 +5838,20 @@ function ensureGoogleLibsLoaded(){
 
 function initGoogleSignIn(){
   const clientIdEl = document.getElementById("bd-client-id");
+  const apiKeyEl = document.getElementById("bd-api-key");
   const clientId = clientIdEl ? clientIdEl.value.trim() : "";
+  const apiKey = apiKeyEl ? apiKeyEl.value.trim() : "";
   if(!clientId){ alert("Paste your Google OAuth Client ID first."); return; }
+  if(!apiKey){ alert("Paste your Google API Key too - the sheet picker needs both (see the setup guide, step: Create an API key)."); return; }
   if(isFileProtocol()){
     setBdStatus("This only works when the tool is hosted at a real https address, not opened as a local file. See the setup guide for hosting steps.", true);
     return;
   }
-  try{ localStorage.setItem(GOOGLE_CLIENT_ID_KEY, clientId); }catch(e){}
+  googleApiKey = apiKey;
+  try{
+    localStorage.setItem(GOOGLE_CLIENT_ID_KEY, clientId);
+    localStorage.setItem(GOOGLE_API_KEY_KEY, apiKey);
+  }catch(e){}
   setBdStatus("Loading Google sign-in...");
   ensureGoogleLibsLoaded().then(()=>{
     tokenClient = google.accounts.oauth2.initTokenClient({
@@ -5870,11 +5882,13 @@ function signOutGoogle(){
 
 function openSheetPicker(){
   if(!googleAccessToken){ alert("Sign in first."); return; }
+  if(!googleApiKey){ alert("Missing API key - sign in again with both the Client ID and API key filled in."); return; }
   if(!pickerApiLoaded){ alert("Picker is still loading - wait a second and try again."); return; }
   const view = new google.picker.DocsView(google.picker.ViewId.SPREADSHEETS).setMode(google.picker.DocsViewMode.LIST);
   const picker = new google.picker.PickerBuilder()
     .addView(view)
     .setOAuthToken(googleAccessToken)
+    .setDeveloperKey(googleApiKey)
     .setCallback(pickerCallback)
     .build();
   picker.setVisible(true);
@@ -6214,6 +6228,8 @@ function initBdTracker(){
   try{
     const savedClientId = localStorage.getItem(GOOGLE_CLIENT_ID_KEY);
     if(savedClientId){ const el = document.getElementById("bd-client-id"); if(el) el.value = savedClientId; }
+    const savedApiKey = localStorage.getItem(GOOGLE_API_KEY_KEY);
+    if(savedApiKey){ const el2 = document.getElementById("bd-api-key"); if(el2) el2.value = savedApiKey; }
   }catch(e){}
   renderLinkedSheetsList();
   renderResearchSuggestions();
