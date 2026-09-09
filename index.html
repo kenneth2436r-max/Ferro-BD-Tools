@@ -1004,6 +1004,9 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
           <option value="contacts">Contacts (sponsors/partners/leads)</option>
           <option value="opportunities">Opportunities Pipeline</option>
           <option value="renewals">Renewals / Follow-ups</option>
+          <option value="revenue">Revenue / Payments</option>
+          <option value="events">Events (auto-splits closed vs upcoming)</option>
+          <option value="generic">Just show this sheet as-is (no mapping)</option>
         </select>
       </div>
       <div><label>Sheet tab</label><select id="bd-mapping-tab" class="editable"></select></div>
@@ -1011,7 +1014,8 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
     </div>
     <div id="bd-mapping-fields"></div>
     <button class="btn small no-print" onclick="saveSheetMapping()">Save link</button>
-    <button class="btn small secondary no-print" onclick="document.getElementById('bd-mapping-card').style.display='none'; mappingContext=null;">Cancel</button>
+    <button class="btn small secondary no-print" id="bd-mapping-skip-btn" style="display:none;" onclick="skipQueuedSheet()">Skip this sheet</button>
+    <button class="btn small secondary no-print" onclick="cancelMappingQueue()">Cancel</button>
   </div>
 
   <div class="card">
@@ -1041,6 +1045,39 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
       <thead><tr><th>Member/Contact</th><th>Plan/Type</th><th>Renewal date</th><th>Status</th><th>Notes</th><th>Source</th></tr></thead>
       <tbody></tbody>
     </table>
+  </div>
+
+  <div class="card">
+    <h3>Revenue &amp; Payments</h3>
+    <p class="muted" style="margin-top:0;">Auto-totalled from every linked Revenue/Payments sheet - overall, this month, and anything marked pending/overdue.</p>
+    <div id="bd-revenue-summary" style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;"></div>
+    <div id="bd-revenue-bysource"></div>
+    <table id="bd-revenue-table">
+      <thead><tr><th>Date</th><th>Source</th><th>Amount</th><th>Status</th><th>Notes</th><th>Sheet</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Events</h3>
+    <p class="muted" style="margin-top:0;">Automatically split into upcoming vs closed/past based on date (or status, if marked completed/cancelled).</p>
+    <div id="bd-events-summary" style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px;"></div>
+    <h4 style="margin-bottom:4px;">Upcoming</h4>
+    <table id="bd-events-upcoming-table">
+      <thead><tr><th>Event</th><th>Date</th><th>Status</th><th>Revenue</th><th>Footfall</th><th>Notes</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h4 style="margin-bottom:4px;margin-top:16px;">Closed / Past</h4>
+    <table id="bd-events-closed-table">
+      <thead><tr><th>Event</th><th>Date</th><th>Status</th><th>Revenue</th><th>Footfall</th><th>Notes</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="bd-generic-sheets-wrap" style="display:none;">
+    <h3>Other linked sheets</h3>
+    <p class="muted" style="margin-top:0;">Sheets you linked as "just show as-is" - shown exactly as their columns are, no schema applied.</p>
+    <div id="bd-generic-sheets"></div>
   </div>
 
   <div class="card">
@@ -5796,6 +5833,21 @@ const BD_CATEGORY_FIELDS = {
     {key:"renewalDate", label:"Renewal date", required:true},
     {key:"status", label:"Status"},
     {key:"notes", label:"Notes"}
+  ],
+  revenue: [
+    {key:"date", label:"Date", required:true},
+    {key:"source", label:"Source / Category"},
+    {key:"amount", label:"Amount", required:true},
+    {key:"status", label:"Status"},
+    {key:"notes", label:"Notes"}
+  ],
+  events: [
+    {key:"eventName", label:"Event Name", required:true},
+    {key:"date", label:"Date", required:true},
+    {key:"status", label:"Status"},
+    {key:"revenue", label:"Revenue"},
+    {key:"footfall", label:"Footfall / Attendance"},
+    {key:"notes", label:"Notes"}
   ]
 };
 
@@ -5887,6 +5939,7 @@ function openSheetPicker(){
   const view = new google.picker.DocsView(google.picker.ViewId.SPREADSHEETS).setMode(google.picker.DocsViewMode.LIST);
   const picker = new google.picker.PickerBuilder()
     .addView(view)
+    .enableFeature(google.picker.Feature.MULTISELECT_ENABLED)
     .setOAuthToken(googleAccessToken)
     .setDeveloperKey(googleApiKey)
     .setCallback(pickerCallback)
@@ -5894,10 +5947,43 @@ function openSheetPicker(){
   picker.setVisible(true);
 }
 
+// Picking several sheets at once (multi-select is enabled above) queues them and walks
+// through one mapping card at a time - each pre-filled with a best-guess category and
+// column mapping (see guessBdCategory / guessBdColumnIndex), so the common case is just
+// glance-and-click rather than filling anything in by hand.
+let pickerQueue = [];
+let pickerQueueTotal = 0;
+
 function pickerCallback(data){
   if(!data || data.action !== google.picker.Action.PICKED) return;
-  const doc = data.docs[0];
-  fetchSheetHeadersAndOpenMapping(doc.id, doc.name);
+  const docs = data.docs || [];
+  if(!docs.length) return;
+  pickerQueue = docs.map(d=>({id:d.id, name:d.name}));
+  pickerQueueTotal = pickerQueue.length;
+  processNextQueuedSheet();
+}
+
+function processNextQueuedSheet(){
+  if(!pickerQueue.length){
+    if(pickerQueueTotal > 1) setBdStatus("All "+pickerQueueTotal+" picked sheets processed.");
+    pickerQueueTotal = 0;
+    return;
+  }
+  const next = pickerQueue.shift();
+  fetchSheetHeadersAndOpenMapping(next.id, next.name);
+}
+
+function skipQueuedSheet(){
+  document.getElementById("bd-mapping-card").style.display = "none";
+  mappingContext = null;
+  processNextQueuedSheet();
+}
+
+function cancelMappingQueue(){
+  pickerQueue = [];
+  pickerQueueTotal = 0;
+  document.getElementById("bd-mapping-card").style.display = "none";
+  mappingContext = null;
 }
 
 function sheetsApiGet(url){
@@ -5926,14 +6012,18 @@ function fetchSheetHeadersAndOpenMapping(spreadsheetId, spreadsheetName){
 function openMappingUI(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow){
   mappingContext = {spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow};
   document.getElementById("bd-mapping-card").style.display = "";
-  document.getElementById("bd-mapping-title").textContent = "Link: " + spreadsheetName;
+  const progress = pickerQueueTotal > 1 ? ` (sheet ${pickerQueueTotal - pickerQueue.length} of ${pickerQueueTotal})` : "";
+  document.getElementById("bd-mapping-title").textContent = "Link: " + spreadsheetName + progress;
   const tabSelect = document.getElementById("bd-mapping-tab");
   tabSelect.innerHTML = tabs.map(t=>`<option value="${escapeHtml(t.title)}" ${t.title===chosenTab?"selected":""}>${escapeHtml(t.title)}</option>`).join("");
   tabSelect.onchange = ()=> reloadMappingHeaderRow();
   document.getElementById("bd-mapping-label").value = spreadsheetName;
-  document.getElementById("bd-mapping-category").value = "contacts";
+  document.getElementById("bd-mapping-category").value = guessBdCategory(headerRow);
   renderMappingFields(headerRow);
+  document.getElementById("bd-mapping-skip-btn").style.display = pickerQueue.length > 0 ? "" : "none";
   setBdStatus("");
+  const card = document.getElementById("bd-mapping-card");
+  if(card.scrollIntoView) card.scrollIntoView({behavior:"smooth", block:"center"});
 }
 
 function reloadMappingHeaderRow(){
@@ -5967,7 +6057,13 @@ const BD_FIELD_SYNONYMS = {
   category: ["category","type","segment"],
   value: ["value","amount","worth","estimate"],
   plan: ["plan","type","membership"],
-  renewalDate: ["renewal","expiry","expiration","due date","renew"]
+  renewalDate: ["renewal","expiry","expiration","due date","renew"],
+  date: ["date","when","day"],
+  source: ["source","sport","coach","platform","game"],
+  amount: ["amount","amt","payment","fee","price","paid","collection"],
+  eventName: ["event","name","title"],
+  revenue: ["revenue","earnings","collection","amount","gross"],
+  footfall: ["footfall","attendance","participants","turnout","headcount"]
 };
 
 function guessBdColumnIndex(headerRow, field){
@@ -5975,24 +6071,71 @@ function guessBdColumnIndex(headerRow, field){
   const target = norm(field.label);
   const targetKey = norm(field.key);
   const synonyms = (BD_FIELD_SYNONYMS[field.key]||[]).map(norm);
+  // Only match when the COLUMN HEADER contains the field's key/label/synonym (e.g. header
+  // "Sponsor Name" containing "name" is a real signal). Deliberately NOT matching the reverse
+  // direction (a short/generic header like bare "Date" being a substring of a longer label
+  // like "Next Action Date") - that direction caused real false positives: a bare "Date"
+  // column matched every *Date field, and "Event Name" matched the generic "name" key,
+  // which made an events sheet get auto-detected as Contacts. Under-matching (leaving a
+  // column unmapped for her to pick manually) is the safer failure mode than over-matching.
   for(let i=0;i<headerRow.length;i++){
     const h = norm(headerRow[i]);
     if(!h) continue;
-    if(h===target || h===targetKey || h.includes(targetKey) || target.includes(h)) return i;
+    if(h===target || h===targetKey || h.includes(targetKey)) return i;
   }
   for(let i=0;i<headerRow.length;i++){
     const h = norm(headerRow[i]);
     if(!h) continue;
-    if(synonyms.some(syn=> h.includes(syn) || syn.includes(h))) return i;
+    if(synonyms.some(syn=> h.includes(syn))) return i;
   }
   return -1;
+}
+
+// Best-effort category guess from a sheet's own header row, so linking a sheet doesn't
+// default to "Contacts" every time regardless of what it actually contains. Requires every
+// *required* field of a category to find a confident column match, plus at least 2 total
+// field matches, before committing to that category - otherwise falls back to "generic"
+// (never wrong, just unmapped) rather than risk silently misfiling real data.
+function guessBdCategory(headerRow){
+  const scores = {};
+  Object.keys(BD_CATEGORY_FIELDS).forEach(cat=>{
+    const fields = BD_CATEGORY_FIELDS[cat];
+    const requiredFields = fields.filter(f=>f.required);
+    const requiredMatched = requiredFields.every(f=>guessBdColumnIndex(headerRow, f) >= 0);
+    if(!requiredMatched) return;
+    scores[cat] = fields.reduce((n,f)=> n + (guessBdColumnIndex(headerRow, f) >= 0 ? 1 : 0), 0);
+  });
+  const ranked = Object.entries(scores).sort((a,b)=>b[1]-a[1]);
+  if(!ranked.length) return "generic";
+  const [topCat, topScore] = ranked[0];
+  const runnerUpScore = ranked.length > 1 ? ranked[1][1] : 0;
+  // Require a real, unambiguous lead before committing to a structured category - a tie or
+  // near-tie means the headers are genuinely ambiguous between two categories, so fall back
+  // to "generic" (nothing lost, she maps it manually) rather than confidently guess wrong.
+  return (topScore >= 2 && topScore > runnerUpScore) ? topCat : "generic";
+}
+
+function genericColumnMap(headerRow){
+  const map = {};
+  const seen = {};
+  (headerRow||[]).forEach((h,i)=>{
+    let key = String(h||"").trim() || ("Column "+(i+1));
+    if(seen[key]!==undefined){ seen[key]++; key = key+" ("+seen[key]+")"; } else { seen[key]=1; }
+    map[key] = i;
+  });
+  return map;
 }
 
 function renderMappingFields(headerRow){
   headerRow = headerRow || (mappingContext ? mappingContext.headerRow : []) || [];
   const category = document.getElementById("bd-mapping-category").value;
-  const fields = BD_CATEGORY_FIELDS[category];
   const wrap = document.getElementById("bd-mapping-fields");
+  if(category === "generic"){
+    const list = headerRow.filter(Boolean).map(h=>escapeHtml(h)).join(", ");
+    wrap.innerHTML = `<p class="muted">No mapping needed - this sheet's own columns will be shown exactly as they are${list ? ": "+list : " (reading columns...)"}.</p>`;
+    return;
+  }
+  const fields = BD_CATEGORY_FIELDS[category];
   wrap.innerHTML = fields.map(f=>{
     const guess = guessBdColumnIndex(headerRow, f);
     const options = ['<option value="">- not tracked -</option>']
@@ -6006,12 +6149,17 @@ function saveSheetMapping(){
   if(!mappingContext) return;
   const category = document.getElementById("bd-mapping-category").value;
   const label = document.getElementById("bd-mapping-label").value.trim() || mappingContext.spreadsheetName;
-  const fields = BD_CATEGORY_FIELDS[category];
-  const selects = document.querySelectorAll(".bd-map-select");
-  const columnMap = {};
-  selects.forEach(sel=>{ if(sel.value !== "") columnMap[sel.dataset.field] = Number(sel.value); });
-  const missingRequired = fields.filter(f=>f.required && !(f.key in columnMap));
-  if(missingRequired.length){ alert("Please map all fields marked with * before saving: " + missingRequired.map(f=>f.label).join(", ")); return; }
+  let columnMap;
+  if(category === "generic"){
+    columnMap = genericColumnMap(mappingContext.headerRow);
+  } else {
+    const fields = BD_CATEGORY_FIELDS[category];
+    const selects = document.querySelectorAll(".bd-map-select");
+    columnMap = {};
+    selects.forEach(sel=>{ if(sel.value !== "") columnMap[sel.dataset.field] = Number(sel.value); });
+    const missingRequired = fields.filter(f=>f.required && !(f.key in columnMap));
+    if(missingRequired.length){ alert("Please map all fields marked with * before saving: " + missingRequired.map(f=>f.label).join(", ")); return; }
+  }
   const entry = {
     id: uid(),
     label,
@@ -6029,6 +6177,7 @@ function saveSheetMapping(){
   mappingContext = null;
   renderLinkedSheetsList();
   refreshSheet(entry.id);
+  processNextQueuedSheet();
 }
 
 function refreshSheet(id){
@@ -6084,7 +6233,7 @@ function renderLinkedSheetsList(){
     tbody.innerHTML = `<tr><td colspan="5" class="muted">No sheets linked yet.</td></tr>`;
     return;
   }
-  const catLabels = {contacts:"Contacts", opportunities:"Opportunities", renewals:"Renewals"};
+  const catLabels = {contacts:"Contacts", opportunities:"Opportunities", renewals:"Renewals", revenue:"Revenue/Payments", events:"Events", generic:"As-is (no mapping)"};
   linkedSheets.forEach(s=>{
     const tr = document.createElement("tr");
     tr.innerHTML = `<td><b>${escapeHtml(s.label)}</b><div class="muted" style="font-size:11px;">${escapeHtml(s.spreadsheetName)} - ${escapeHtml(s.tabTitle)}</div></td>
@@ -6108,7 +6257,129 @@ function renderBdData(){
   renderBdSection("contacts", "bd-contacts-table", ["name","org","contactType","phone","email","status","lastContact","nextActionDate","notes"]);
   renderBdSection("opportunities", "bd-opportunities-table", ["title","category","status","value","nextActionDate","notes"]);
   renderBdSection("renewals", "bd-renewals-table", ["name","plan","renewalDate","status","notes"]);
+  renderRevenueSection();
+  renderEventsSection();
+  renderGenericSheets();
   renderBdSummary();
+}
+
+function parseBdNumber(v){
+  const n = parseFloat(String(v==null?"":v).replace(/[^0-9.\-]/g,""));
+  return isNaN(n) ? 0 : n;
+}
+
+function bdStatCard(value, label){
+  return `<div style="background:#F4F6F8;border:1px solid var(--border);border-radius:6px;padding:10px 16px;min-width:140px;">
+    <div style="font-size:20px;font-weight:bold;color:var(--navy);">${value}</div><div class="muted" style="font-size:12px;">${label}</div></div>`;
+}
+
+function collectBdRows(category){
+  const sheets = linkedSheets.filter(s=>s.category===category);
+  let allRows = [];
+  sheets.forEach(s=> (s.cachedRows||[]).forEach(r=> allRows.push(Object.assign({_source:s.label}, r))));
+  return allRows;
+}
+
+function renderRevenueSection(){
+  const table = document.getElementById("bd-revenue-table");
+  if(!table) return;
+  const tbody = table.querySelector("tbody");
+  const allRows = collectBdRows("revenue");
+  if(!allRows.length){
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">No Revenue/Payments sheet linked yet, or nothing synced.</td></tr>`;
+  } else {
+    tbody.innerHTML = "";
+    allRows.forEach(r=>{
+      const tr = document.createElement("tr");
+      const amt = parseBdNumber(r.amount);
+      const statusLower = String(r.status||"").toLowerCase();
+      if(/pending|due|overdue|unpaid/.test(statusLower)) tr.style.background = "#FFF6E0";
+      const amtDisplay = amt ? ("Rs " + amt.toLocaleString("en-IN")) : escapeHtml(r.amount||"");
+      tr.innerHTML = `<td>${escapeHtml(r.date||"")}</td><td>${escapeHtml(r.source||"")}</td><td>${amtDisplay}</td><td>${escapeHtml(r.status||"")}</td><td>${escapeHtml(r.notes||"")}</td><td class="muted" style="font-size:11px;">${escapeHtml(r._source)}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  const now = new Date();
+  let total=0, thisMonth=0, pending=0;
+  const bySource = {};
+  allRows.forEach(r=>{
+    const amt = parseBdNumber(r.amount);
+    total += amt;
+    const d = r.date ? new Date(r.date) : null;
+    if(d && !isNaN(d.getTime()) && d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear()) thisMonth += amt;
+    if(/pending|due|overdue|unpaid/.test(String(r.status||"").toLowerCase())) pending += amt;
+    const src = r.source || "Unspecified";
+    bySource[src] = (bySource[src]||0) + amt;
+  });
+  const summaryEl = document.getElementById("bd-revenue-summary");
+  if(summaryEl){
+    summaryEl.innerHTML =
+      bdStatCard("Rs "+Math.round(total).toLocaleString("en-IN"), "total tracked") +
+      bdStatCard("Rs "+Math.round(thisMonth).toLocaleString("en-IN"), "this month") +
+      bdStatCard("Rs "+Math.round(pending).toLocaleString("en-IN"), "pending/overdue");
+  }
+  const bySourceEl = document.getElementById("bd-revenue-bysource");
+  if(bySourceEl){
+    const rows = Object.entries(bySource).sort((a,b)=>b[1]-a[1]);
+    bySourceEl.innerHTML = rows.length ? `<table style="margin-bottom:14px;"><thead><tr><th>Source</th><th>Total</th></tr></thead><tbody>${
+      rows.map(([src,amt])=>`<tr><td>${escapeHtml(src)}</td><td>Rs ${Math.round(amt).toLocaleString("en-IN")}</td></tr>`).join("")
+    }</tbody></table>` : "";
+  }
+}
+
+function renderEventsSection(){
+  const upTable = document.getElementById("bd-events-upcoming-table");
+  const closedTable = document.getElementById("bd-events-closed-table");
+  if(!upTable || !closedTable) return;
+  const upBody = upTable.querySelector("tbody");
+  const closedBody = closedTable.querySelector("tbody");
+  const allRows = collectBdRows("events");
+  const today = new Date(); today.setHours(0,0,0,0);
+  const upcoming = [], closed = [];
+  allRows.forEach(r=>{
+    const d = r.date ? new Date(r.date) : null;
+    const isPast = (d && !isNaN(d.getTime())) ? d.getTime() < today.getTime() : false;
+    const explicitlyClosed = /completed|closed|done|cancelled/.test(String(r.status||"").toLowerCase());
+    (isPast || explicitlyClosed ? closed : upcoming).push(r);
+  });
+  const fillTable = (body, rows) => {
+    body.innerHTML = rows.length ? rows.map(r=>
+      `<tr><td>${escapeHtml(r.eventName||"")}</td><td>${escapeHtml(r.date||"")}</td><td>${escapeHtml(r.status||"")}</td><td>${escapeHtml(r.revenue||"")}</td><td>${escapeHtml(r.footfall||"")}</td><td>${escapeHtml(r.notes||"")}</td></tr>`
+    ).join("") : `<tr><td colspan="6" class="muted">None yet.</td></tr>`;
+  };
+  fillTable(upBody, upcoming);
+  fillTable(closedBody, closed);
+
+  const summaryEl = document.getElementById("bd-events-summary");
+  if(summaryEl){
+    const closedRevenue = closed.reduce((sum,r)=>sum+parseBdNumber(r.revenue),0);
+    summaryEl.innerHTML =
+      bdStatCard(allRows.length, "total events tracked") +
+      bdStatCard(upcoming.length, "upcoming") +
+      bdStatCard(closed.length, "closed/past") +
+      bdStatCard("Rs "+Math.round(closedRevenue).toLocaleString("en-IN"), "revenue from closed events");
+  }
+}
+
+function renderGenericSheets(){
+  const wrapCard = document.getElementById("bd-generic-sheets-wrap");
+  const container = document.getElementById("bd-generic-sheets");
+  if(!wrapCard || !container) return;
+  const sheets = linkedSheets.filter(s=>s.category==="generic");
+  if(!sheets.length){ wrapCard.style.display = "none"; container.innerHTML = ""; return; }
+  wrapCard.style.display = "";
+  container.innerHTML = sheets.map(s=>{
+    const cols = Object.keys(s.columnMap||{});
+    const rows = s.cachedRows || [];
+    const headerHtml = cols.map(c=>`<th>${escapeHtml(c)}</th>`).join("");
+    const rowsHtml = rows.length
+      ? rows.map(r=>`<tr>${cols.map(c=>`<td>${escapeHtml(String(r[c]||""))}</td>`).join("")}</tr>`).join("")
+      : `<tr><td colspan="${cols.length||1}" class="muted">No rows synced yet.</td></tr>`;
+    const syncedNote = s.lastSynced ? ", synced "+new Date(s.lastSynced).toLocaleString("en-IN") : "";
+    return `<h4 style="margin-bottom:4px;">${escapeHtml(s.label)} <span class="muted" style="font-weight:normal;font-size:12px;">(${rows.length} rows${syncedNote})</span></h4>
+      <table style="margin-bottom:18px;"><thead><tr>${headerHtml}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
+  }).join("");
 }
 
 function renderBdSection(category, tableId, cols){
