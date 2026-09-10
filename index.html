@@ -987,8 +987,8 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
 
   <div class="card">
     <h3>2. Link your sheets</h3>
-    <p class="muted" style="margin-top:0;">Pick a sheet, tell it which columns mean what, and it'll read from that sheet from then on. Link as many as you need - e.g. one for sponsor contacts, one for the opportunities pipeline.</p>
-    <button class="btn small no-print" onclick="openSheetPicker()">+ Link a Google Sheet</button>
+    <p class="muted" style="margin-top:0;">Pick as many sheets as you want (multi-select works in the picker) - each one gets read automatically: it figures out what kind of data it is, reads every tab, and starts tracking it. Nothing to fill in. If it ever gets a sheet wrong, use "Edit" on that row to fix it by hand.</p>
+    <button class="btn small no-print" onclick="openSheetPicker()">+ Link Google Sheet(s)</button>
     <button class="btn small secondary no-print" onclick="refreshAllSheets()">Refresh all</button>
     <table id="bd-linked-sheets-table" style="margin-top:12px;">
       <thead><tr><th>Sheet</th><th>Tracking as</th><th>Rows</th><th>Last synced</th><th></th></tr></thead>
@@ -997,7 +997,8 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
   </div>
 
   <div class="card" id="bd-mapping-card" style="display:none;border:2px solid var(--gold);">
-    <h3 id="bd-mapping-title">Link a sheet</h3>
+    <h3 id="bd-mapping-title">Edit tracking</h3>
+    <p class="muted" style="margin-top:0;">Nothing here is required - change only what you want to fix and save. Leaving a field on "- not tracked -" is fine, it just won't show in that column.</p>
     <div class="row">
       <div><label>Track this as</label>
         <select id="bd-mapping-category" class="editable" onchange="renderMappingFields(mappingContext && mappingContext.headerRow || [])">
@@ -1022,8 +1023,7 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
     </div>
     <p class="muted" style="margin:4px 0 0;">This only ever reads your sheet - nothing is written back, and your sheet itself is never changed.</p>
     <div id="bd-mapping-fields"></div>
-    <button class="btn small no-print" onclick="saveSheetMapping()">Save link</button>
-    <button class="btn small secondary no-print" id="bd-mapping-skip-btn" style="display:none;" onclick="skipQueuedSheet()">Skip this sheet</button>
+    <button class="btn small no-print" onclick="saveSheetMapping()">Save changes</button>
     <button class="btn small secondary no-print" onclick="cancelMappingQueue()">Cancel</button>
   </div>
 
@@ -5956,12 +5956,17 @@ function openSheetPicker(){
   picker.setVisible(true);
 }
 
-// Picking several sheets at once (multi-select is enabled above) queues them and walks
-// through one mapping card at a time - each pre-filled with a best-guess category and
-// column mapping (see guessBdCategory / guessBdColumnIndex), so the common case is just
-// glance-and-click rather than filling anything in by hand.
+// Picking several sheets at once (multi-select is enabled above) queues them and links
+// each one fully automatically - no card, no clicking, nothing to fill in: category is
+// guessed from the headers (guessBdCategory), columns are best-effort auto-mapped
+// (guessBdColumnIndex), every tab in the sheet is read (mergeAllTabs defaults on), and the
+// entry is saved and refreshed straight away. If a guess is ever wrong, "Edit" on that row
+// in the linked-sheets table re-opens the mapping card so it can be fixed by hand - but
+// that's optional, never required, per Devyanee's request that nothing should need manual
+// detail-filling before it starts tracking.
 let pickerQueue = [];
 let pickerQueueTotal = 0;
+let pickerResults = [];
 
 function pickerCallback(data){
   if(!data || data.action !== google.picker.Action.PICKED) return;
@@ -5969,23 +5974,24 @@ function pickerCallback(data){
   if(!docs.length) return;
   pickerQueue = docs.map(d=>({id:d.id, name:d.name}));
   pickerQueueTotal = pickerQueue.length;
+  pickerResults = [];
   processNextQueuedSheet();
 }
 
 function processNextQueuedSheet(){
   if(!pickerQueue.length){
-    if(pickerQueueTotal > 1) setBdStatus("All "+pickerQueueTotal+" picked sheets processed.");
+    if(pickerQueueTotal >= 1){
+      const ok = pickerResults.filter(r=>r.ok);
+      const failed = pickerResults.filter(r=>!r.ok);
+      let msg = "Linked "+ok.length+" of "+pickerQueueTotal+" sheet(s) automatically"+(ok.length ? ": "+ok.map(r=>r.name+" ("+r.categoryLabel+")").join(", ") : "")+".";
+      if(failed.length) msg += " Couldn't read: "+failed.map(r=>r.name).join(", ")+".";
+      setBdStatus(msg);
+    }
     pickerQueueTotal = 0;
     return;
   }
   const next = pickerQueue.shift();
-  fetchSheetHeadersAndOpenMapping(next.id, next.name);
-}
-
-function skipQueuedSheet(){
-  document.getElementById("bd-mapping-card").style.display = "none";
-  mappingContext = null;
-  processNextQueuedSheet();
+  fetchSheetHeadersAndAutoLink(next.id, next.name);
 }
 
 function cancelMappingQueue(){
@@ -6002,9 +6008,48 @@ function sheetsApiGet(url){
   });
 }
 
-function fetchSheetHeadersAndOpenMapping(spreadsheetId, spreadsheetName){
-  setBdStatus("Reading sheet structure...");
-  sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`)
+const CAT_LABELS = {contacts:"Contacts", opportunities:"Opportunities", renewals:"Renewals", revenue:"Revenue/Payments", events:"Events", generic:"as-is"};
+
+// Best-effort column mapping used by the automatic link flow: maps whatever fields can be
+// confidently guessed and simply leaves the rest unmapped ("not tracked") - never blocks on
+// a missing/required field, since Devyanee doesn't want to fill anything in by hand.
+function autoMapCategoryFields(headerRow, category){
+  const fields = BD_CATEGORY_FIELDS[category] || [];
+  const map = {};
+  fields.forEach(f=>{
+    const idx = guessBdColumnIndex(headerRow, f);
+    if(idx >= 0) map[f.key] = idx;
+  });
+  return map;
+}
+
+function autoLinkPickedSheet(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow){
+  const category = guessBdCategory(headerRow);
+  const columnMap = category === "generic" ? genericColumnMap(headerRow) : autoMapCategoryFields(headerRow, category);
+  const entry = {
+    id: uid(),
+    label: spreadsheetName,
+    category,
+    spreadsheetId,
+    spreadsheetName,
+    tabTitle: chosenTab,
+    mergeAllTabs: true,
+    columnMap,
+    lastSynced: null,
+    cachedRows: []
+  };
+  linkedSheets.push(entry);
+  saveLinkedSheets();
+  renderLinkedSheetsList();
+  // Silent + awaited by the caller so a batch of picked sheets links and refreshes fully,
+  // one at a time, before the aggregate "Linked N of M" summary is shown - otherwise a
+  // later sheet's refresh could finish after the summary and overwrite it.
+  return refreshSheet(entry.id, {silent:true}).then(()=> entry);
+}
+
+function fetchSheetHeadersAndAutoLink(spreadsheetId, spreadsheetName){
+  setBdStatus("Reading "+spreadsheetName+"...");
+  return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`)
     .then(meta=>{
       const tabs = (meta.sheets||[]).map(s=>s.properties);
       if(!tabs.length) throw new Error("That sheet has no tabs.");
@@ -6012,17 +6057,49 @@ function fetchSheetHeadersAndOpenMapping(spreadsheetId, spreadsheetName){
       return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(firstTab.title)}!1:1`)
         .then(headerResp=>({tabs, headerRow: (headerResp.values && headerResp.values[0]) || [], chosenTab: firstTab.title}));
     })
-    .then(({tabs, headerRow, chosenTab})=>{
-      openMappingUI(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow);
+    .then(({tabs, headerRow, chosenTab})=> autoLinkPickedSheet(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow))
+    .then(entry=>{
+      pickerResults.push({name: spreadsheetName, ok:true, categoryLabel: CAT_LABELS[entry.category]||entry.category});
+      processNextQueuedSheet();
     })
-    .catch(err=>{ setBdStatus("Couldn't read that sheet: "+err.message, true); });
+    .catch(err=>{
+      pickerResults.push({name: spreadsheetName, ok:false});
+      processNextQueuedSheet();
+    });
+}
+
+// Manual edit path - opens the same mapping card, but pre-filled with this sheet's saved
+// settings rather than a fresh guess, and never required: it's only reached by clicking
+// "Edit" on an already-linked sheet.
+function openEditMapping(id){
+  const entry = linkedSheets.find(s=>s.id===id);
+  if(!entry) return;
+  if(!googleAccessToken){ setBdStatus("Sign in first to edit a linked sheet.", true); return; }
+  setBdStatus("Reading columns...");
+  sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
+    .then(meta=>{
+      const tabs = (meta.sheets||[]).map(s=>s.properties);
+      return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(entry.tabTitle)}!1:1`)
+        .then(headerResp=>({tabs, headerRow: (headerResp.values && headerResp.values[0]) || []}));
+    })
+    .then(({tabs, headerRow})=>{
+      openMappingUI(entry.spreadsheetId, entry.spreadsheetName, tabs, entry.tabTitle, headerRow);
+      mappingContext.editingId = entry.id;
+      document.getElementById("bd-mapping-title").textContent = "Edit tracking: " + entry.label;
+      document.getElementById("bd-mapping-category").value = entry.category;
+      document.getElementById("bd-mapping-label").value = entry.label;
+      document.getElementById("bd-mapping-merge-tabs").checked = !!entry.mergeAllTabs;
+      onMergeTabsToggle();
+      renderMappingFields(headerRow, entry.columnMap);
+      setBdStatus("");
+    })
+    .catch(err=> setBdStatus("Couldn't read that sheet: "+err.message, true));
 }
 
 function openMappingUI(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow){
   mappingContext = {spreadsheetId, spreadsheetName, tabs, chosenTab, headerRow};
   document.getElementById("bd-mapping-card").style.display = "";
-  const progress = pickerQueueTotal > 1 ? ` (sheet ${pickerQueueTotal - pickerQueue.length} of ${pickerQueueTotal})` : "";
-  document.getElementById("bd-mapping-title").textContent = "Link: " + spreadsheetName + progress;
+  document.getElementById("bd-mapping-title").textContent = "Edit tracking: " + spreadsheetName;
   const tabSelect = document.getElementById("bd-mapping-tab");
   tabSelect.innerHTML = tabs.map(t=>`<option value="${escapeHtml(t.title)}" ${t.title===chosenTab?"selected":""}>${escapeHtml(t.title)}</option>`).join("");
   tabSelect.onchange = ()=> reloadMappingHeaderRow();
@@ -6032,7 +6109,6 @@ function openMappingUI(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRo
   mergeBox.checked = false;
   tabSelect.disabled = false;
   renderMappingFields(headerRow);
-  document.getElementById("bd-mapping-skip-btn").style.display = pickerQueue.length > 0 ? "" : "none";
   setBdStatus("");
   const card = document.getElementById("bd-mapping-card");
   if(card.scrollIntoView) card.scrollIntoView({behavior:"smooth", block:"center"});
@@ -6143,7 +6219,10 @@ function genericColumnMap(headerRow){
   return map;
 }
 
-function renderMappingFields(headerRow){
+// presetMap (optional): when editing an already-linked sheet, pre-select each field's
+// currently-saved column instead of a fresh best-guess, so opening "Edit" shows what's
+// actually in effect rather than silently reverting to the guess.
+function renderMappingFields(headerRow, presetMap){
   headerRow = headerRow || (mappingContext ? mappingContext.headerRow : []) || [];
   const category = document.getElementById("bd-mapping-category").value;
   const wrap = document.getElementById("bd-mapping-fields");
@@ -6154,14 +6233,17 @@ function renderMappingFields(headerRow){
   }
   const fields = BD_CATEGORY_FIELDS[category];
   wrap.innerHTML = fields.map(f=>{
-    const guess = guessBdColumnIndex(headerRow, f);
+    const preset = presetMap && (f.key in presetMap) ? presetMap[f.key] : guessBdColumnIndex(headerRow, f);
     const options = ['<option value="">- not tracked -</option>']
-      .concat(headerRow.map((h,i)=>`<option value="${i}" ${i===guess?"selected":""}>${escapeHtml(h||("Column "+(i+1)))}</option>`));
-    return `<div class="row"><div style="flex:1;"><label>${escapeHtml(f.label)}${f.required?" *":""}</label>
+      .concat(headerRow.map((h,i)=>`<option value="${i}" ${i===preset?"selected":""}>${escapeHtml(h||("Column "+(i+1)))}</option>`));
+    return `<div class="row"><div style="flex:1;"><label>${escapeHtml(f.label)}</label>
       <select class="editable bd-map-select" data-field="${f.key}">${options.join("")}</select></div></div>`;
   }).join("");
 }
 
+// No required-field validation here on purpose - Devyanee wants every sheet read and
+// tracked with zero manual filling-in, so a field left on "- not tracked -" just means that
+// column won't show up, never a blocker on saving.
 function saveSheetMapping(){
   if(!mappingContext) return;
   const category = document.getElementById("bd-mapping-category").value;
@@ -6170,32 +6252,62 @@ function saveSheetMapping(){
   if(category === "generic"){
     columnMap = genericColumnMap(mappingContext.headerRow);
   } else {
-    const fields = BD_CATEGORY_FIELDS[category];
     const selects = document.querySelectorAll(".bd-map-select");
     columnMap = {};
     selects.forEach(sel=>{ if(sel.value !== "") columnMap[sel.dataset.field] = Number(sel.value); });
-    const missingRequired = fields.filter(f=>f.required && !(f.key in columnMap));
-    if(missingRequired.length){ alert("Please map all fields marked with * before saving: " + missingRequired.map(f=>f.label).join(", ")); return; }
   }
-  const entry = {
-    id: uid(),
-    label,
-    category,
-    spreadsheetId: mappingContext.spreadsheetId,
-    spreadsheetName: mappingContext.spreadsheetName,
-    tabTitle: mappingContext.chosenTab,
-    mergeAllTabs: document.getElementById("bd-mapping-merge-tabs").checked,
-    columnMap,
-    lastSynced: null,
-    cachedRows: []
-  };
-  linkedSheets.push(entry);
-  saveLinkedSheets();
+  const mergeAllTabs = document.getElementById("bd-mapping-merge-tabs").checked;
+  if(mappingContext.editingId){
+    const entry = linkedSheets.find(s=>s.id===mappingContext.editingId);
+    if(entry){
+      entry.label = label;
+      entry.category = category;
+      entry.tabTitle = mappingContext.chosenTab;
+      entry.mergeAllTabs = mergeAllTabs;
+      entry.columnMap = columnMap;
+      saveLinkedSheets();
+      refreshSheet(entry.id);
+    }
+  } else {
+    const entry = {
+      id: uid(), label, category,
+      spreadsheetId: mappingContext.spreadsheetId,
+      spreadsheetName: mappingContext.spreadsheetName,
+      tabTitle: mappingContext.chosenTab,
+      mergeAllTabs, columnMap,
+      lastSynced: null,
+      cachedRows: []
+    };
+    linkedSheets.push(entry);
+    saveLinkedSheets();
+    refreshSheet(entry.id);
+  }
   document.getElementById("bd-mapping-card").style.display = "none";
   mappingContext = null;
   renderLinkedSheetsList();
-  refreshSheet(entry.id);
-  processNextQueuedSheet();
+}
+
+// Drops exact-duplicate rows so the same booking/payment/event/contact never gets counted
+// twice - covers both a row appearing in more than one tab of the same sheet (e.g. a
+// "Master" tab that also duplicates rows already in the monthly tabs, relevant once
+// mergeAllTabs is reading every tab) and the same row showing up across two different
+// linked sheets that happen to overlap. Signature is every mapped field's value, normalized
+// (trimmed + lowercased) so formatting differences like "Rs 500" vs "rs500" don't matter,
+// with _source excluded so the same real row from two different sheets still counts as one
+// duplicate. Fully blank rows are never deduped against each other (that would collapse
+// unrelated empty rows into one).
+function dedupeBdRows(rows){
+  const seen = new Set();
+  const out = [];
+  rows.forEach(r=>{
+    const sig = Object.keys(r).filter(k=>k!=="_source").sort()
+      .map(k=> String(r[k]==null ? "" : r[k]).trim().toLowerCase()).join("|");
+    if(!sig.replace(/\|/g,"")){ out.push(r); return; }
+    if(seen.has(sig)) return;
+    seen.add(sig);
+    out.push(r);
+  });
+  return out;
 }
 
 function mapRowsWithColumnMap(rows, columnMap){
@@ -6209,17 +6321,23 @@ function mapRowsWithColumnMap(rows, columnMap){
   });
 }
 
-function refreshSheet(id){
+// opts.silent suppresses the per-sheet "Refreshing.../Refreshed..." status messages - used
+// while auto-linking a batch of picked sheets, where several refreshes can be in flight
+// close together and would otherwise stomp on each other (and on the batch summary message
+// shown once the whole picked batch is done). The normal "Refresh" link in the linked-sheets
+// table still gets its own status message.
+function refreshSheet(id, opts){
+  const silent = opts && opts.silent;
   const entry = linkedSheets.find(s=>s.id===id);
-  if(!entry) return;
-  if(!googleAccessToken){ setBdStatus("Sign in first to refresh.", true); return; }
-  setBdStatus("Refreshing "+entry.label+"...");
+  if(!entry) return Promise.resolve();
+  if(!googleAccessToken){ setBdStatus("Sign in first to refresh.", true); return Promise.resolve(); }
+  if(!silent) setBdStatus("Refreshing "+entry.label+"...");
 
   if(entry.mergeAllTabs){
     // Read-only: fetches the current tab list fresh each time (so a newly-added weekly/
     // monthly tab gets picked up automatically) and concatenates every tab's rows using the
     // same column mapping - never writes anything back to the sheet itself.
-    sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
+    return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
       .then(meta=>{
         const tabTitles = (meta.sheets||[]).map(s=>s.properties.title);
         return Promise.all(tabTitles.map(title=>
@@ -6230,28 +6348,27 @@ function refreshSheet(id){
       })
       .then(perTabRows=>{
         const allRows = [].concat(...perTabRows);
-        entry.cachedRows = mapRowsWithColumnMap(allRows, entry.columnMap);
+        entry.cachedRows = dedupeBdRows(mapRowsWithColumnMap(allRows, entry.columnMap));
         entry.lastSynced = new Date().toISOString();
         saveLinkedSheets();
         renderLinkedSheetsList();
         renderBdData();
-        setBdStatus("Refreshed "+entry.label+" - "+entry.cachedRows.length+" rows across all tabs.");
+        if(!silent) setBdStatus("Refreshed "+entry.label+" - "+entry.cachedRows.length+" rows across all tabs (duplicates removed).");
       })
-      .catch(err=>{ setBdStatus("Refresh failed for "+entry.label+": "+err.message, true); });
-    return;
+      .catch(err=>{ if(!silent) setBdStatus("Refresh failed for "+entry.label+": "+err.message, true); });
   }
 
-  sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(entry.tabTitle)}?majorDimension=ROWS`)
+  return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(entry.tabTitle)}?majorDimension=ROWS`)
     .then(resp=>{
       const rows = resp.values || [];
-      entry.cachedRows = mapRowsWithColumnMap(rows.slice(1), entry.columnMap);
+      entry.cachedRows = dedupeBdRows(mapRowsWithColumnMap(rows.slice(1), entry.columnMap));
       entry.lastSynced = new Date().toISOString();
       saveLinkedSheets();
       renderLinkedSheetsList();
       renderBdData();
-      setBdStatus("Refreshed "+entry.label+" - "+entry.cachedRows.length+" rows.");
+      if(!silent) setBdStatus("Refreshed "+entry.label+" - "+entry.cachedRows.length+" rows.");
     })
-    .catch(err=>{ setBdStatus("Refresh failed for "+entry.label+": "+err.message, true); });
+    .catch(err=>{ if(!silent) setBdStatus("Refresh failed for "+entry.label+": "+err.message, true); });
 }
 
 function refreshAllSheets(){
@@ -6284,11 +6401,12 @@ function renderLinkedSheetsList(){
   const catLabels = {contacts:"Contacts", opportunities:"Opportunities", renewals:"Renewals", revenue:"Revenue/Payments", events:"Events", generic:"As-is (no mapping)"};
   linkedSheets.forEach(s=>{
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td><b>${escapeHtml(s.label)}</b><div class="muted" style="font-size:11px;">${escapeHtml(s.spreadsheetName)} - ${escapeHtml(s.tabTitle)}</div></td>
+    const tabLabel = s.mergeAllTabs ? "all tabs" : s.tabTitle;
+    tr.innerHTML = `<td><b>${escapeHtml(s.label)}</b><div class="muted" style="font-size:11px;">${escapeHtml(s.spreadsheetName)} - ${escapeHtml(tabLabel)}</div></td>
       <td>${catLabels[s.category]||s.category}</td>
       <td>${s.cachedRows ? s.cachedRows.length : 0}</td>
       <td>${s.lastSynced ? new Date(s.lastSynced).toLocaleString("en-IN") : '<span class="muted">Never</span>'}</td>
-      <td class="no-print"><span onclick="refreshSheet('${s.id}')" style="cursor:pointer;text-decoration:underline;margin-right:12px;">Refresh</span><span class="tag-del" onclick="unlinkSheet('${s.id}')" style="cursor:pointer;">Unlink</span></td>`;
+      <td class="no-print"><span onclick="refreshSheet('${s.id}')" style="cursor:pointer;text-decoration:underline;margin-right:12px;">Refresh</span><span onclick="openEditMapping('${s.id}')" style="cursor:pointer;text-decoration:underline;margin-right:12px;">Edit</span><span class="tag-del" onclick="unlinkSheet('${s.id}')" style="cursor:pointer;">Unlink</span></td>`;
     tbody.appendChild(tr);
   });
 }
@@ -6325,7 +6443,10 @@ function collectBdRows(category){
   const sheets = linkedSheets.filter(s=>s.category===category);
   let allRows = [];
   sheets.forEach(s=> (s.cachedRows||[]).forEach(r=> allRows.push(Object.assign({_source:s.label}, r))));
-  return allRows;
+  // Dedup again across sheets, not just within one - e.g. a "Master" tracker linked
+  // alongside separate monthly sheets that both contain the same rows would otherwise
+  // double-count revenue/events here even though each sheet was clean on its own.
+  return dedupeBdRows(allRows);
 }
 
 function renderRevenueSection(){
@@ -6435,9 +6556,7 @@ function renderBdSection(category, tableId, cols){
   if(!table) return;
   const tbody = table.querySelector("tbody");
   tbody.innerHTML = "";
-  const sheetsInCat = linkedSheets.filter(s=>s.category===category);
-  let allRows = [];
-  sheetsInCat.forEach(s=> (s.cachedRows||[]).forEach(r=> allRows.push(Object.assign({_source:s.label}, r))) );
+  const allRows = collectBdRows(category);
   if(!allRows.length){
     tbody.innerHTML = `<tr><td colspan="${cols.length+1}" class="muted">No sheet linked for this yet, or nothing synced.</td></tr>`;
     return;
