@@ -936,6 +936,21 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
       <div style="flex:2;"><label>Details (optional - included in the notification)</label><textarea id="task-details" class="editable" rows="2" placeholder="Any extra detail you want to see on your phone"></textarea></div>
     </div>
     <div class="row">
+      <div><label>Attach a live number from BD Tracker (optional)</label>
+        <select id="task-stat-source" class="editable">
+          <option value="">None</option>
+          <option value="contacts">Contacts count</option>
+          <option value="opportunities">Opportunities count</option>
+          <option value="renewals">Renewals count</option>
+          <option value="revenue">Revenue total</option>
+          <option value="events">Events count</option>
+        </select>
+      </div>
+      <div style="flex:2;"><label>Only count rows matching this word (optional, e.g. "sponsor")</label>
+        <input type="text" id="task-stat-filter" class="editable" placeholder="Leave blank to count everything in that category"></div>
+    </div>
+    <p class="muted" style="margin:2px 0 10px;">This shows on the task and gets baked into the phone notification when it's (re-)scheduled - so it's as fresh as your last sheet refresh before the reminder fires, not updated at the exact moment it lands.</p>
+    <div class="row">
       <div id="task-date-wrap"><label id="task-date-label">Date</label><input type="date" id="task-date" class="editable"></div>
       <div id="task-weekday-wrap" style="display:none;"><label>Day of week</label>
         <select id="task-weekday" class="editable">
@@ -5695,9 +5710,11 @@ function submitTaskForm(){
   const date = document.getElementById("task-date").value;
   const weekday = document.getElementById("task-weekday").value;
   const monthday = document.getElementById("task-monthday").value;
+  const statSource = document.getElementById("task-stat-source").value;
+  const statFilter = document.getElementById("task-stat-filter").value.trim();
   if(type==="once" && !date){ alert("Pick a date for a one-time task."); return; }
 
-  const taskData = {title, details, type, time, date, weekday, monthday};
+  const taskData = {title, details, type, time, date, weekday, monthday, statSource, statFilter};
   if(editingTaskId){
     const idx = tasks.findIndex(t=>t.id===editingTaskId);
     if(idx>=0) tasks[idx] = Object.assign(tasks[idx], taskData, {lastScheduledFor: null});
@@ -5719,6 +5736,8 @@ function resetTaskForm(){
   document.getElementById("task-weekday").value = "1";
   document.getElementById("task-monthday").value = "1";
   document.getElementById("task-time").value = "09:00";
+  document.getElementById("task-stat-source").value = "";
+  document.getElementById("task-stat-filter").value = "";
   updateTaskFormFields();
 }
 
@@ -5733,6 +5752,8 @@ function editTask(id){
   document.getElementById("task-weekday").value = t.weekday||"1";
   document.getElementById("task-monthday").value = t.monthday||"1";
   document.getElementById("task-time").value = t.time||"09:00";
+  document.getElementById("task-stat-source").value = t.statSource||"";
+  document.getElementById("task-stat-filter").value = t.statFilter||"";
   updateTaskFormFields();
   document.getElementById("task-submit-btn").textContent = "Save changes";
   document.getElementById("task-cancel-btn").style.display = "";
@@ -5771,11 +5792,74 @@ function renderTasksTable(){
   sorted.forEach(t=>{
     const next = computeNextOccurrence(t);
     const tr = document.createElement("tr");
-    const titleCell = t.details ? `<b>${escapeHtml(t.title)}</b><div class="muted" style="font-size:12px;">${escapeHtml(t.details)}</div>` : `<b>${escapeHtml(t.title)}</b>`;
+    const stat = resolveTaskStat(t);
+    const detailsHtml = t.details ? `<div class="muted" style="font-size:12px;">${escapeHtml(t.details)}</div>` : "";
+    const statHtml = stat ? `<div style="font-size:12px;color:var(--navy);">Live: ${escapeHtml(stat)}</div>` : "";
+    const titleCell = `<b>${escapeHtml(t.title)}</b>${detailsHtml}${statHtml}`;
     tr.innerHTML = `<td>${titleCell}</td><td>${typeLabels[t.type]||t.type}</td><td>${next ? formatTaskDateTime(next) : '<span class="muted">Passed</span>'}</td>
       <td class="no-print"><span onclick="editTask('${t.id}')" style="cursor:pointer;margin-right:12px;text-decoration:underline;">Edit</span><span class="tag-del" onclick="deleteTask('${t.id}')" style="cursor:pointer;">x</span></td>`;
     tbody.appendChild(tr);
   });
+}
+
+// Computes a live count/total from BD Tracker's linked-sheet data for a task that has
+// opted into one via task.statSource (e.g. "how many potential sponsors are in the
+// pipeline right now"). Reads whatever is already cached from the last sheet refresh -
+// works even if she isn't currently signed in to Google, same as the rest of BD Tracker's
+// display. Defined here but only ever called once BD Tracker's own data has been loaded
+// (see the bootstrap order at the bottom of the BD Tracker section) since it reads
+// linkedSheets via collectBdRows().
+function resolveTaskStat(task){
+  if(!task || !task.statSource) return null;
+  if(typeof collectBdRows !== "function") return null;
+  let rows;
+  try{ rows = collectBdRows(task.statSource); }catch(e){ return null; }
+  const kw = (task.statFilter||"").trim().toLowerCase();
+  if(kw){
+    rows = rows.filter(r=> Object.keys(r).some(k=> k!=="_source" && String(r[k]==null?"":r[k]).toLowerCase().includes(kw)));
+  }
+  const filterNote = kw ? " matching \""+task.statFilter.trim()+"\"" : "";
+  if(task.statSource === "revenue"){
+    const total = rows.reduce((sum,r)=> sum + parseBdNumber(r.amount), 0);
+    return rows.length + " row(s)"+filterNote+", totalling Rs " + Math.round(total).toLocaleString("en-IN");
+  }
+  if(task.statSource === "opportunities") return rows.length + " opportunit"+(rows.length===1?"y":"ies")+filterNote;
+  return rows.length + " " + task.statSource + filterNote;
+}
+
+// Whenever BD Tracker data changes (a sheet is linked, refreshed, or edited), any task with
+// a live stat attached needs its notification re-baked with the current number - otherwise
+// the phone reminder would keep repeating whatever count was true the day the task was
+// created. Clearing lastScheduledFor for those tasks makes syncTaskNotifications() treat
+// them as needing a fresh schedule next time it runs, same as if their due time had moved.
+// Only resets a task's schedule when its live number has actually MOVED since the last
+// push that included it - not on every BD Tracker refresh. Without this gate, linking
+// several sheets in one batch (each triggering its own data refresh) could re-schedule -
+// and ntfy treats every schedule call as a NEW push, it doesn't replace a pending one - the
+// same reminder several times over for a single round of linking.
+function refreshTaskStatsAfterSync(){
+  if(typeof tasks === "undefined" || !tasks.length) return;
+  let changed = false;
+  tasks.forEach(t=>{
+    if(!t.statSource) return;
+    const stat = resolveTaskStat(t);
+    if(stat !== (t.lastStatSent || null)){ t.lastScheduledFor = null; changed = true; }
+  });
+  if(changed){
+    saveTasksData();
+    syncTaskNotifications();
+  }
+  renderTasksTable();
+}
+
+// A burst of BD Tracker refreshes (e.g. auto-linking several picked sheets one after
+// another) can each call renderBdData() within a second or two of each other. Debouncing
+// collapses that burst into a single check once things settle, instead of re-evaluating
+// (and potentially re-scheduling) once per sheet in the batch.
+let taskStatsRefreshTimer = null;
+function scheduleTaskStatsRefresh(){
+  if(taskStatsRefreshTimer) clearTimeout(taskStatsRefreshTimer);
+  taskStatsRefreshTimer = setTimeout(()=>{ taskStatsRefreshTimer = null; refreshTaskStatsAfterSync(); }, 2000);
 }
 
 function syncTaskNotifications(){
@@ -5789,9 +5873,13 @@ function syncTaskNotifications(){
     if(t.lastScheduledFor === nextIso) return;
     const delaySeconds = Math.round((next.getTime() - now.getTime())/1000);
     if(delaySeconds > NTFY_MAX_DELAY_SECONDS) return;
-    publishNtfy({title: t.title, body: t.details || "Reminder from your FerroHub Report Builder tasks.", delaySeconds: Math.max(10, delaySeconds)})
+    const stat = resolveTaskStat(t);
+    const bodyBase = t.details || "Reminder from your FerroHub Report Builder tasks.";
+    const body = stat ? (bodyBase + "\n\nLive: " + stat) : bodyBase;
+    publishNtfy({title: t.title, body, delaySeconds: Math.max(10, delaySeconds)})
       .catch(err=> console.warn("ntfy schedule error", t.title, err));
     t.lastScheduledFor = nextIso;
+    t.lastStatSent = stat;
     changed = true;
   });
   if(changed) saveTasksData();
@@ -5799,8 +5887,9 @@ function syncTaskNotifications(){
 
 loadTasksData();
 updateTaskFormFields();
-renderTasksTable();
-syncTaskNotifications();
+// renderTasksTable() / syncTaskNotifications() are called further down, after BD Tracker's
+// own data has loaded (see initBdTracker() below) - task rows can show a live BD Tracker
+// stat, which needs linkedSheets to already be populated from localStorage first.
 
 // ===================== BD Tracker (Google Sheets, read-only) =====================
 // This talks to Google directly from the browser (Google Identity Services + the
@@ -6001,11 +6090,51 @@ function cancelMappingQueue(){
   mappingContext = null;
 }
 
+// Google's Sheets API defaults to a 60-reads-per-minute-per-user quota. Reading everything
+// automatically (every tab of every linked sheet, on every "Link" and every "Refresh all")
+// makes a lot of requests in a short burst, which trips that quota (HTTP 429). Rather than
+// just failing, every call here goes through one shared queue that (a) spaces requests out
+// so a big batch doesn't burst past the limit, and (b) automatically waits and retries a
+// couple of times if a 429 slips through anyway - the quota is per-minute, so a short wait
+// is normally all it takes to recover. This never changes what's being read, only paces it.
+let sheetsApiQueue = Promise.resolve();
+let sheetsApiLastCallAt = 0;
+const SHEETS_API_MIN_GAP_MS = 1100; // ~55 req/min, safely under the 60/min default quota
+
+// The actual fetch + 429-retry recursion - deliberately NOT going back through the shared
+// queue on retry. Recursing through sheetsApiGet() itself here would re-enqueue behind the
+// queue slot this very call already occupies (the queue variable gets reassigned to depend
+// on THIS call's result before the retry's own promise has settled), which deadlocks -
+// neither promise can ever resolve since each is waiting on the other. A retry is a
+// continuation of the same in-flight request, not a new one, so it just waits out its own
+// backoff and calls the fetch again directly.
+function sheetsApiFetchWithRetry(url, attempt){
+  attempt = attempt || 0;
+  const waitMs = Math.max(0, sheetsApiLastCallAt + SHEETS_API_MIN_GAP_MS - Date.now());
+  return new Promise(resolve=>setTimeout(resolve, waitMs))
+    .then(()=>{
+      sheetsApiLastCallAt = Date.now();
+      return fetch(url, { headers: { "Authorization": "Bearer " + googleAccessToken } });
+    })
+    .then(r=>{
+      if(r.status === 429 && attempt < 5){
+        const backoffMs = Math.min(30000, 3000 * Math.pow(2, attempt));
+        setBdStatus("Google's read limit was hit for a moment - retrying automatically in "+Math.round(backoffMs/1000)+"s...", true);
+        return new Promise(resolve=>setTimeout(resolve, backoffMs)).then(()=> sheetsApiFetchWithRetry(url, attempt+1));
+      }
+      if(!r.ok) return r.text().then(t=>{ throw new Error("Sheets API error "+r.status+": "+t.slice(0,200)); });
+      return r.json();
+    });
+}
+
 function sheetsApiGet(url){
-  return fetch(url, { headers: { "Authorization": "Bearer " + googleAccessToken } }).then(r=>{
-    if(!r.ok) return r.text().then(t=>{ throw new Error("Sheets API error "+r.status+": "+t.slice(0,200)); });
-    return r.json();
-  });
+  // Chain onto the shared queue so every request (across every in-flight sheet/tab fetch)
+  // is serialized to one-at-a-time, instead of many parallel Promise.all() calls bursting
+  // past the quota together.
+  const run = () => sheetsApiFetchWithRetry(url, 0);
+  const result = sheetsApiQueue.then(run, run);
+  sheetsApiQueue = result.then(()=>{}, ()=>{}); // keep the queue alive even if this call fails
+  return result;
 }
 
 const CAT_LABELS = {contacts:"Contacts", opportunities:"Opportunities", renewals:"Renewals", revenue:"Revenue/Payments", events:"Events", generic:"as-is"};
@@ -6043,8 +6172,11 @@ function autoLinkPickedSheet(spreadsheetId, spreadsheetName, tabs, chosenTab, he
   renderLinkedSheetsList();
   // Silent + awaited by the caller so a batch of picked sheets links and refreshes fully,
   // one at a time, before the aggregate "Linked N of M" summary is shown - otherwise a
-  // later sheet's refresh could finish after the summary and overwrite it.
-  return refreshSheet(entry.id, {silent:true}).then(()=> entry);
+  // later sheet's refresh could finish after the summary and overwrite it. knownTabTitles
+  // reuses the tab list fetchSheetHeadersAndAutoLink already just read, instead of
+  // refreshSheet's merge-all-tabs path fetching that same metadata a second time - one
+  // fewer Sheets API call per linked sheet, which matters given the per-minute read quota.
+  return refreshSheet(entry.id, {silent:true, knownTabTitles: (tabs||[]).map(t=>t.title)}).then(()=> entry);
 }
 
 function fetchSheetHeadersAndAutoLink(spreadsheetId, spreadsheetName){
@@ -6336,10 +6468,16 @@ function refreshSheet(id, opts){
   if(entry.mergeAllTabs){
     // Read-only: fetches the current tab list fresh each time (so a newly-added weekly/
     // monthly tab gets picked up automatically) and concatenates every tab's rows using the
-    // same column mapping - never writes anything back to the sheet itself.
-    return sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
-      .then(meta=>{
-        const tabTitles = (meta.sheets||[]).map(s=>s.properties.title);
+    // same column mapping - never writes anything back to the sheet itself. If the caller
+    // already just fetched this sheet's tab list (opts.knownTabTitles - true right after
+    // auto-linking), reuse it instead of asking Google for the same metadata again; saves
+    // an API call per linked sheet, which adds up against the per-minute read quota.
+    const tabTitlesPromise = (opts && opts.knownTabTitles && opts.knownTabTitles.length)
+      ? Promise.resolve(opts.knownTabTitles)
+      : sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
+          .then(meta=> (meta.sheets||[]).map(s=>s.properties.title));
+    return tabTitlesPromise
+      .then(tabTitles=>{
         return Promise.all(tabTitles.map(title=>
           sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(title)}?majorDimension=ROWS`)
             .then(resp=> (resp.values || []).slice(1))
@@ -6427,6 +6565,7 @@ function renderBdData(){
   renderEventsSection();
   renderGenericSheets();
   renderBdSummary();
+  if(typeof scheduleTaskStatsRefresh === "function") scheduleTaskStatsRefresh();
 }
 
 function parseBdNumber(v){
@@ -6675,6 +6814,12 @@ function initBdTracker(){
 }
 
 initBdTracker();
+
+// Now that BD Tracker's own linkedSheets data has loaded, tasks can safely be rendered and
+// (re-)scheduled - renderTasksTable()/resolveTaskStat() read linkedSheets via
+// collectBdRows(), which wasn't populated yet earlier at the top of the Tasks section.
+renderTasksTable();
+syncTaskNotifications();
 
 // ===== One-time import: 8 Sept 2026 BD Meeting Minutes =====
 // Adds the General Points (which apply to every venue) plus the football C-Division
