@@ -1012,6 +1012,15 @@ Footfall: Cricket 40, Football 30, Events 10, Pickleball 185</pre>
       <div><label>Sheet tab</label><select id="bd-mapping-tab" class="editable"></select></div>
       <div style="flex:2;"><label>Label (what to call this here)</label><input type="text" id="bd-mapping-label" class="editable" placeholder="e.g. Sponsor Contacts"></div>
     </div>
+    <div class="row">
+      <div style="flex:1;">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--text);">
+          <input type="checkbox" id="bd-mapping-merge-tabs" onchange="onMergeTabsToggle()" style="width:auto;">
+          Merge every tab in this sheet, not just the one above (good for one-tab-per-week/month sheets - new tabs get picked up automatically on refresh)
+        </label>
+      </div>
+    </div>
+    <p class="muted" style="margin:4px 0 0;">This only ever reads your sheet - nothing is written back, and your sheet itself is never changed.</p>
     <div id="bd-mapping-fields"></div>
     <button class="btn small no-print" onclick="saveSheetMapping()">Save link</button>
     <button class="btn small secondary no-print" id="bd-mapping-skip-btn" style="display:none;" onclick="skipQueuedSheet()">Skip this sheet</button>
@@ -6019,11 +6028,19 @@ function openMappingUI(spreadsheetId, spreadsheetName, tabs, chosenTab, headerRo
   tabSelect.onchange = ()=> reloadMappingHeaderRow();
   document.getElementById("bd-mapping-label").value = spreadsheetName;
   document.getElementById("bd-mapping-category").value = guessBdCategory(headerRow);
+  const mergeBox = document.getElementById("bd-mapping-merge-tabs");
+  mergeBox.checked = false;
+  tabSelect.disabled = false;
   renderMappingFields(headerRow);
   document.getElementById("bd-mapping-skip-btn").style.display = pickerQueue.length > 0 ? "" : "none";
   setBdStatus("");
   const card = document.getElementById("bd-mapping-card");
   if(card.scrollIntoView) card.scrollIntoView({behavior:"smooth", block:"center"});
+}
+
+function onMergeTabsToggle(){
+  const merge = document.getElementById("bd-mapping-merge-tabs").checked;
+  document.getElementById("bd-mapping-tab").disabled = merge;
 }
 
 function reloadMappingHeaderRow(){
@@ -6167,6 +6184,7 @@ function saveSheetMapping(){
     spreadsheetId: mappingContext.spreadsheetId,
     spreadsheetName: mappingContext.spreadsheetName,
     tabTitle: mappingContext.chosenTab,
+    mergeAllTabs: document.getElementById("bd-mapping-merge-tabs").checked,
     columnMap,
     lastSynced: null,
     cachedRows: []
@@ -6180,23 +6198,53 @@ function saveSheetMapping(){
   processNextQueuedSheet();
 }
 
+function mapRowsWithColumnMap(rows, columnMap){
+  return rows.filter(r=>r.length).map(r=>{
+    const obj = {};
+    Object.keys(columnMap).forEach(field=>{
+      const idx = columnMap[field];
+      obj[field] = (r[idx] !== undefined) ? r[idx] : "";
+    });
+    return obj;
+  });
+}
+
 function refreshSheet(id){
   const entry = linkedSheets.find(s=>s.id===id);
   if(!entry) return;
   if(!googleAccessToken){ setBdStatus("Sign in first to refresh.", true); return; }
   setBdStatus("Refreshing "+entry.label+"...");
+
+  if(entry.mergeAllTabs){
+    // Read-only: fetches the current tab list fresh each time (so a newly-added weekly/
+    // monthly tab gets picked up automatically) and concatenates every tab's rows using the
+    // same column mapping - never writes anything back to the sheet itself.
+    sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}?fields=sheets.properties`)
+      .then(meta=>{
+        const tabTitles = (meta.sheets||[]).map(s=>s.properties.title);
+        return Promise.all(tabTitles.map(title=>
+          sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(title)}?majorDimension=ROWS`)
+            .then(resp=> (resp.values || []).slice(1))
+            .catch(()=> []) // one unreadable/empty tab shouldn't sink the whole merge
+        ));
+      })
+      .then(perTabRows=>{
+        const allRows = [].concat(...perTabRows);
+        entry.cachedRows = mapRowsWithColumnMap(allRows, entry.columnMap);
+        entry.lastSynced = new Date().toISOString();
+        saveLinkedSheets();
+        renderLinkedSheetsList();
+        renderBdData();
+        setBdStatus("Refreshed "+entry.label+" - "+entry.cachedRows.length+" rows across all tabs.");
+      })
+      .catch(err=>{ setBdStatus("Refresh failed for "+entry.label+": "+err.message, true); });
+    return;
+  }
+
   sheetsApiGet(`https://sheets.googleapis.com/v4/spreadsheets/${entry.spreadsheetId}/values/${encodeURIComponent(entry.tabTitle)}?majorDimension=ROWS`)
     .then(resp=>{
       const rows = resp.values || [];
-      const dataRows = rows.slice(1);
-      entry.cachedRows = dataRows.filter(r=>r.length).map(r=>{
-        const obj = {};
-        Object.keys(entry.columnMap).forEach(field=>{
-          const idx = entry.columnMap[field];
-          obj[field] = (r[idx] !== undefined) ? r[idx] : "";
-        });
-        return obj;
-      });
+      entry.cachedRows = mapRowsWithColumnMap(rows.slice(1), entry.columnMap);
       entry.lastSynced = new Date().toISOString();
       saveLinkedSheets();
       renderLinkedSheetsList();
@@ -6508,6 +6556,45 @@ function initBdTracker(){
 }
 
 initBdTracker();
+
+// ===== One-time import: 8 Sept 2026 BD Meeting Minutes =====
+// Adds the General Points (which apply to every venue) plus the football C-Division
+// outreach item Devyanee confirmed applies to Budigere, as new Tasks & Reminders entries.
+// Also drops a few revenue-idea leads pulled from other venues' sections (Ferrohub Millers
+// Road's revenue-share event model, SUFC's new community-game formats, PnP's recurring
+// clinic format) into Research Suggestions, since she asked to use anything useful to her
+// venue. Runs once per browser (guarded by MOM_20260908_APPLIED_KEY) so it never
+// re-appends on every page load, and never touches or overwrites anything she's already
+// edited - it only adds new rows.
+const MOM_20260908_APPLIED_KEY = "ferrohub_mom_20260908_applied_v1";
+const MOM_20260908_TASKS = [
+  {title:"End-of-day payment check - no dues carried forward", details:"Per 8 Sept BD meeting: collect payments in advance and make sure nothing is pending by the start of tomorrow. Train VEs on this too.", type:"daily", time:"20:30", date:"", weekday:"1", monthday:"1"},
+  {title:"AT-RISK customer outreach via PlaySpaces", details:"Identify AT-RISK customers on PlaySpaces and call them. Log calls made, number who answered, responses/feedback, and follow-ups needed - include this breakdown in the weekly report.", type:"weekly", time:"15:00", date:"", weekday:"5", monthday:"1"},
+  {title:"Add reasons behind booking/revenue changes to weekly report", details:"Don't just report the week-over-week numbers - note the actual reasons/contributing factors behind any increase or decrease.", type:"weekly", time:"09:00", date:"", weekday:"1", monthday:"1"},
+  {title:"Log this week's BD outreach activity in weekly report", details:"Make sure whatever outreach happened this week (calls, meetings, collabs, event pitches) is actually written into the weekly report.", type:"weekly", time:"09:15", date:"", weekday:"1", monthday:"1"},
+  {title:"C-Division football team outreach - Budigere", details:"Per 8 Sept BD meeting: all football venues should begin outreach to C-Division football teams. Keep an action report tracking who's been contacted and progress.", type:"weekly", time:"15:00", date:"", weekday:"3", monthday:"1"}
+];
+const MOM_20260908_RESEARCH = [
+  {title:"Revenue-share partner event model (e.g. Ferro x Pilates)", category:"Revenue idea", contact:"", notes:"Millers Road is running a 50-50 revenue-share Pilates event (20 Sept, off-peak hours) plus Rs 50K/month from the partner for venue branding. Worth testing a similar revenue-share + branding-fee partnership at Budigere during off-peak slots."},
+  {title:"New community game formats", category:"Revenue idea", contact:"", notes:"SUFC is introducing women's community games, morning games, and skill-level-based games to lift community game numbers - worth piloting at Budigere too."},
+  {title:"Recurring clinic/Americano-style formats", category:"Revenue idea", contact:"", notes:"PnP's Padel Clinic (12 participants) and Padel Americano went well as recurring formats. Consider a similar recurring clinic or tournament-lite format for underused sports/slots at Budigere."}
+];
+(function applyMomUpdate_20260908(){
+  try{
+    if(localStorage.getItem(MOM_20260908_APPLIED_KEY)) return;
+    const newTasks = MOM_20260908_TASKS.map(t => Object.assign({id: uid(), lastScheduledFor: null}, t));
+    tasks = tasks.concat(newTasks);
+    saveTasksData();
+    const newResearch = MOM_20260908_RESEARCH.map(r => Object.assign({id: uid(), addedAt: new Date().toISOString()}, r));
+    researchSuggestions = researchSuggestions.concat(newResearch);
+    saveResearchSuggestions();
+    localStorage.setItem(MOM_20260908_APPLIED_KEY, "1");
+    renderTasksTable();
+    syncTaskNotifications();
+    renderResearchSuggestions();
+    renderBdSummary();
+  }catch(e){ console.warn("could not apply 8 Sept MoM update", e); }
+})();
 
 (function restoreDraftOnLoad(){
   try{
